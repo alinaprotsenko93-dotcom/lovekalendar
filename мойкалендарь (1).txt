@@ -1,0 +1,228 @@
+LoveTracker/
+ ├─ app/
+ │   ├─ src/main/java/com/example/lovetracker/
+ │   │   ├─ data/
+ │   │   │   ├─ LoveDay.kt         // Модель
+ │   │   │   ├─ LoveDayDao.kt      // DAO
+ │   │   │   └─ LoveDatabase.kt    // Room база
+ │   │   ├─ ui/
+ │   │   │   ├─ MainScreen.kt      // Экран ежедневных отметок
+ │   │   │   ├─ CalendarScreen.kt  // Календарь истории
+ │   │   │   └─ Theme.kt           // Цвета, шрифты
+ │   │   ├─ widget/
+ │   │   │   ├─ LoveWidget.kt      // Виджет Glance
+ │   │   │   └─ LoveWidgetReceiver.kt
+ │   │   ├─ LoveViewModel.kt       // ViewModel
+ │   │   └─ MainActivity.kt        // Запуск приложения
+ │   └─ AndroidManifest.xml
+ └─ build.gradle
+@Entity
+data class LoveDay(
+    @PrimaryKey val date: String,
+    val wasIntimate: Boolean = false,
+    val hadExperiment: Boolean = false,
+    val pleasureReceived: Boolean = false,
+    val partnerComment: String? = null,
+    val missedByPartner: Boolean = false,
+    val freezeUsed: Boolean = false,
+    val taskCompleted: Boolean = false
+)
+@Dao
+interface LoveDayDao {
+    @Query("SELECT * FROM LoveDay ORDER BY date ASC")
+    suspend fun getAllDays(): List<LoveDay>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertDay(day: LoveDay)
+
+    @Query("DELETE FROM LoveDay")
+    suspend fun clearAll()
+}
+@Database(entities = [LoveDay::class], version = 1)
+abstract class LoveDatabase : RoomDatabase() {
+    abstract fun loveDayDao(): LoveDayDao
+
+    companion object {
+        @Volatile private var INSTANCE: LoveDatabase? = null
+        fun getDatabase(context: Context): LoveDatabase {
+            return INSTANCE ?: synchronized(this) {
+                val instance = Room.databaseBuilder(
+                    context.applicationContext,
+                    LoveDatabase::class.java,
+                    "love_db"
+                ).build()
+                INSTANCE = instance
+                instance
+            }
+        }
+    }
+}
+class LoveViewModel(application: Application) : AndroidViewModel(application) {
+    private val dao = LoveDatabase.getDatabase(application).loveDayDao()
+
+    private val _days = MutableStateFlow<List<LoveDay>>(emptyList())
+    val days: StateFlow<List<LoveDay>> = _days
+
+    private val _streak = MutableStateFlow(0)
+    val streak: StateFlow<Int> = _streak
+
+    init { loadDays() }
+
+    fun loadDays() = viewModelScope.launch {
+        val allDays = dao.getAllDays().sortedBy { it.date }
+        _days.value = allDays
+        calculateStreak(allDays)
+    }
+
+    private fun calculateStreak(allDays: List<LoveDay>) {
+        var currentStreak = 0
+        var freezeCount = 0
+        for (day in allDays) {
+            if (day.wasIntimate || day.freezeUsed) currentStreak++
+            else {
+                freezeCount++
+                if (freezeCount >= 3) {
+                    viewModelScope.launch { dao.clearAll() }
+                    currentStreak = 0
+                    break
+                }
+            }
+        }
+        _streak.value = currentStreak
+    }
+
+    fun markDay(
+        wasIntimate: Boolean,
+        hadExperiment: Boolean,
+        pleasureReceived: Boolean,
+        partnerComment: String? = null,
+        missedByPartner: Boolean = false,
+        taskCompleted: Boolean = false,
+        freezeUsed: Boolean = false
+    ) {
+        val date = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+        val day = LoveDay(
+            date, wasIntimate, hadExperiment, pleasureReceived,
+            partnerComment, missedByPartner, freezeUsed, taskCompleted
+        )
+        viewModelScope.launch {
+            dao.insertDay(day)
+            loadDays()
+        }
+    }
+
+    fun calculateKisses(): Int {
+        return _days.value.sumOf {
+            var total = 0
+            if (it.wasIntimate) total += 10
+            if (it.hadExperiment) total += 50
+            if (it.pleasureReceived) total += 50
+            if (it.taskCompleted) total += 10
+            total
+        }
+    }
+}
+@Composable
+fun MainScreen(viewModel: LoveViewModel = viewModel()) {
+    val days by viewModel.days.collectAsState()
+    val kisses = viewModel.calculateKisses()
+
+    var wasIntimate by remember { mutableStateOf(false) }
+    var hadExperiment by remember { mutableStateOf(false) }
+    var pleasureReceived by remember { mutableStateOf(false) }
+    var comment by remember { mutableStateOf("") }
+
+    Column(modifier = Modifier.padding(16.dp)) {
+        Text("💋 Поцелуйчиков: $kisses", color = Color.Red)
+        Spacer(Modifier.height(8.dp))
+
+        Button(onClick = { wasIntimate = !wasIntimate }) {
+            Text(if (wasIntimate) "Отметка: Было 🔥" else "Отметить день интимности")
+        }
+        Spacer(Modifier.height(8.dp))
+        Button(onClick = { hadExperiment = !hadExperiment }) {
+            Text(if (hadExperiment) "Был эксперимент 🌟" else "Добавить эксперимент")
+        }
+        Spacer(Modifier.height(8.dp))
+        Button(onClick = { pleasureReceived = !pleasureReceived }) {
+            Text(if (pleasureReceived) "Получено удовольствие ❤️" else "Добавить удовольствие")
+        }
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = comment,
+            onValueChange = { comment = it },
+            label = { Text("Комментарий партнёра") }
+        )
+        Spacer(Modifier.height(8.dp))
+        Button(onClick = {
+            viewModel.markDay(wasIntimate, hadExperiment, pleasureReceived, comment)
+            wasIntimate = false
+            hadExperiment = false
+            pleasureReceived = false
+            comment = ""
+        }) { Text("Сохранить день ❤️") }
+        Spacer(Modifier.height(16.dp))
+        Text("История дней:", color = Color.DarkRed)
+        days.forEach { day ->
+            val emoji = when {
+                day.wasIntimate && day.taskCompleted -> "🔥✨"
+                day.wasIntimate -> "🔥"
+                day.freezeUsed -> "❄️"
+                else -> "💤"
+            }
+            Text("${day.date}: $emoji ${day.partnerComment ?: ""}")
+        }
+    }
+}
+@Composable
+fun CalendarScreen(viewModel: LoveViewModel = viewModel()) {
+    val days by viewModel.days.collectAsState()
+    LazyColumn(modifier = Modifier.padding(16.dp)) {
+        items(days) { day ->
+            val emoji = when {
+                day.wasIntimate && day.taskCompleted -> "🔥✨"
+                day.wasIntimate -> "🔥"
+                day.freezeUsed -> "❄️"
+                else -> "💤"
+            }
+            Text("${day.date}: $emoji ${day.partnerComment ?: ""}", color = Color.Red)
+        }
+    }
+}
+class LoveWidget : GlanceAppWidget() {
+    @Composable
+    override fun Content() {
+        val db = Room.databaseBuilder(
+            LocalContext.current,
+            LoveDatabase::class.java, "love_db"
+        ).build()
+        val dao = db.loveDayDao()
+        val days = runBlocking { dao.getAllDays() }
+        val streak = days.count { it.wasIntimate || it.freezeUsed }
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xFFFFC0CB))
+                .padding(16.dp)
+        ) {
+            Text("🔥 Ударный режим: $streak дней", color = Color.Red)
+        }
+    }
+}
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val viewModel: LoveViewModel = ViewModelProvider(this)[LoveViewModel::class.java]
+
+        setContent {
+            MaterialTheme {
+                Column {
+                    MainScreen(viewModel)
+                    Spacer(Modifier.height(16.dp))
+                    CalendarScreen(viewModel)
+                }
+            }
+        }
+    }
+}
